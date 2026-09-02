@@ -1,6 +1,0 @@
-DISPLAY_NAME=Android GPT
-DESCRIPTION=Web dashboard for Android device management
-MAIN=starter.py
-LANGUAGE=python
-MEMORY=512
-VERSION=recommended
