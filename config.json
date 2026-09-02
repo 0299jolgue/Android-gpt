@@ -8,7 +8,7 @@
     "templates": "templates",
     "static": "static",
     "generated": "generated",
-    "logs": "data/logs"
+    "logs": "data/logs/app.log"
   },
   "auth": {
     "admin_username": "admin",
