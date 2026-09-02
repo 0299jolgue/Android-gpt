@@ -1,1 +1,25 @@
-{% extends 'base.html' %}{% block title %}Gerador · Android GPT{% endblock %}{% block content %}<header class="page-head"><div><h1>Gerador</h1><p>Define o perfil da app Android e prepara um projeto para build.</p></div></header><section class="panel generator"><form method="post" action="/api/generator"><label>Nome da aplicação<input name="app_name" value="Android GPT Agent" required></label><label>URL do servidor<input name="server_url" placeholder="https://teu-dominio" required></label><div class="checks"><label><input type="checkbox" name="device_info" checked> Informações do dispositivo</label><label><input type="checkbox" name="battery" checked> Estado da bateria</label><label><input type="checkbox" name="notifications"> Notificações</label><label><input type="checkbox" name="selected_files"> Ficheiros selecionados pelo utilizador</label></div><div class="note">O gerador cria um projeto Android configurado. O build do APK depende de Android SDK/Gradle disponíveis no servidor.</div><button class="button" type="submit">Gerar projeto</button></form></section>{% endblock %}
+{% extends 'base.html' %}
+{% block title %}Gerador · Android GPT{% endblock %}
+{% block content %}
+<header class="page-head">
+  <div>
+    <h1>Gerador</h1>
+    <p>Define o perfil da app Android e prepara um projeto para build.</p>
+  </div>
+</header>
+<section class="panel generator">
+  <form method="post" action="/api/generator">
+    <label>Nome da aplicação<input name="app_name" value="Android GPT Agent" required></label>
+
+    <div class="checks">
+      <label><input type="checkbox" name="device_info" checked> Informações do dispositivo</label>
+      <label><input type="checkbox" name="battery" checked> Estado da bateria</label>
+      <label><input type="checkbox" name="notifications"> Notificações</label>
+      <label><input type="checkbox" name="selected_files"> Ficheiros selecionados pelo utilizador</label>
+    </div>
+
+    <div class="note">O servidor é associado automaticamente ao projeto gerado. Não precisas de configurar endereços manualmente.</div>
+    <button class="button" type="submit">Gerar projeto</button>
+  </form>
+</section>
+{% endblock %}
