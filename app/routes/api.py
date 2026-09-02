@@ -1,3 +1,5 @@
+import json
+import re
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -26,10 +28,60 @@ def _public_server_url(request: Request) -> str:
     return f"{scheme}://{host}".rstrip("/")
 
 
+def _safe_slug(value: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
+    return (value.strip("._-") or "android_gpt_agent")[:48]
+
+
+def _cache_paths(app_name: str) -> tuple[Path, Path]:
+    base = _safe_slug(app_name)
+    apk = settings.generated / "apks" / f"{base}.apk"
+    metadata = settings.generated / "apks" / f"{base}.json"
+    return apk, metadata
+
+
+def _cached_apk(app_name: str, server_url: str, features: dict[str, bool]) -> Path | None:
+    apk, metadata = _cache_paths(app_name)
+    if not apk.is_file() or not metadata.is_file():
+        return None
+    try:
+        saved = json.loads(metadata.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    wanted = {
+        "app_name": app_name,
+        "server_url": server_url.rstrip("/"),
+        "features": features,
+    }
+    return apk if saved == wanted else None
+
+
+def _save_cache_metadata(app_name: str, server_url: str, features: dict[str, bool]) -> None:
+    _, metadata = _cache_paths(app_name)
+    metadata.parent.mkdir(parents=True, exist_ok=True)
+    metadata.write_text(
+        json.dumps(
+            {"app_name": app_name, "server_url": server_url.rstrip("/"), "features": features},
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
 def _run_build(job_id: str, app_name: str, server_url: str, features: dict[str, bool]) -> None:
     _jobs[job_id].update({"status": "building", "message": "A preparar o ambiente Android e a compilar o APK…"})
     try:
+        apk = _cached_apk(app_name, server_url, features)
+        if apk is not None:
+            _jobs[job_id].update({
+                "status": "ready",
+                "message": "APK já existente para esta configuração — pronto imediatamente.",
+                "download": f"/api/generator/download/{apk.name}",
+            })
+            return
+
         apk, project = build_apk(app_name, server_url, features)
+        _save_cache_metadata(app_name, server_url, features)
         _jobs[job_id].update({
             "status": "ready",
             "message": "APK pronto.",
@@ -64,9 +116,19 @@ async def generator(request: Request):
     create_project(app_name, server_url, features)
 
     job_id = uuid.uuid4().hex
+    cached = _cached_apk(app_name, server_url, features)
+    if cached is not None:
+        _jobs[job_id] = {
+            "status": "ready",
+            "message": "APK já existente para esta configuração — pronto imediatamente.",
+            "app_name": app_name,
+            "download": f"/api/generator/download/{cached.name}",
+        }
+        return {"ok": True, "job_id": job_id, "status_url": f"/api/generator/status/{job_id}"}
+
     _jobs[job_id] = {
         "status": "queued",
-        "message": "APK colocado na fila de compilação.",
+        "message": "APK colocado na fila de compilação. Podes mudar de aba ou fechar o navegador.",
         "app_name": app_name,
     }
     _executor.submit(_run_build, job_id, app_name, server_url, features)
