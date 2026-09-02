@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 import re
 import shutil
@@ -23,6 +25,9 @@ TOOLCHAIN_ROOT = settings.generated / ".toolchain"
 SDK_ROOT = TOOLCHAIN_ROOT / "android-sdk"
 GRADLE_ROOT = TOOLCHAIN_ROOT / f"gradle-{_GRADLE_VERSION}"
 JDK_ROOT = TOOLCHAIN_ROOT / "jdk-17"
+WORKSPACE = BUILD_ROOT / "workspace"
+TOOLCHAIN_READY = TOOLCHAIN_ROOT / ".ready"
+GRADLE_READY = TOOLCHAIN_ROOT / ".gradle-ready"
 
 _lock = threading.Lock()
 
@@ -32,17 +37,23 @@ def _download(url: str, destination: Path) -> None:
     tmp = destination.with_suffix(destination.suffix + ".part")
     if tmp.exists():
         tmp.unlink()
-    request = urllib.request.Request(url, headers={"User-Agent": "Android-GPT/3.0"})
+    request = urllib.request.Request(url, headers={"User-Agent": "Android-GPT/4.0"})
     with urllib.request.urlopen(request, timeout=120) as response, tmp.open("wb") as out:
         while True:
-            chunk = response.read(1024 * 1024)
+            chunk = response.read(4 * 1024 * 1024)
             if not chunk:
                 break
             out.write(chunk)
     tmp.replace(destination)
 
 
-def _run(command: list[str], cwd: Path | None = None, env: dict | None = None, input_text: str | None = None) -> str:
+def _run(
+    command: list[str],
+    cwd: Path | None = None,
+    env: dict | None = None,
+    input_text: str | None = None,
+    timeout: int = 900,
+) -> str:
     result = subprocess.run(
         command,
         cwd=str(cwd) if cwd else None,
@@ -51,11 +62,13 @@ def _run(command: list[str], cwd: Path | None = None, env: dict | None = None, i
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        timeout=900,
+        timeout=timeout,
         check=False,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"Comando falhou ({result.returncode}): {' '.join(command)}\n{result.stdout[-12000:]}")
+        raise RuntimeError(
+            f"Comando falhou ({result.returncode}): {' '.join(command)}\n{result.stdout[-12000:]}"
+        )
     return result.stdout
 
 
@@ -63,9 +76,8 @@ def _java_home() -> Path:
     system_java = shutil.which("java")
     if system_java:
         try:
-            out = _run([system_java, "-version"])
-            # java -version normally prints on stderr, but some builds redirect it.
-            if "version \"1." in out or re.search(r'version "(17|18|19|20|21|22|23|24|25)', out):
+            out = _run([system_java, "-version"], timeout=20)
+            if re.search(r'version "(?:1\.)?(?:17|18|19|20|21|22|23|24|25)', out):
                 return Path(system_java).resolve().parent.parent
         except Exception:
             pass
@@ -93,7 +105,7 @@ def _gradle_bin() -> Path:
     candidate = GRADLE_ROOT / "bin" / "gradle"
     if candidate.exists():
         return candidate
-    archive = TOOLCHAIN_ROOT / f"gradle-{_GRADLE_VERSION}.zip"
+    archive = TOOLCHAIN_ROOT / f"gradle-{_GRADLE_VERSION}-bin.zip"
     _download(_GRADLE_URL, archive)
     TOOLCHAIN_ROOT.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(archive) as zf:
@@ -131,23 +143,39 @@ def _sdkmanager() -> Path:
     return candidate
 
 
-def _ensure_sdk() -> Path:
+def _ensure_sdk(java_home: Path) -> Path:
     sdkmanager = _sdkmanager()
     env = os.environ.copy()
     env["ANDROID_HOME"] = str(SDK_ROOT)
     env["ANDROID_SDK_ROOT"] = str(SDK_ROOT)
-    env["JAVA_HOME"] = str(_java_home())
-    _run([str(sdkmanager), "--sdk_root=" + str(SDK_ROOT), "--licenses"], env=env, input_text="y\n" * 40)
-    _run(
-        [
-            str(sdkmanager),
-            "--sdk_root=" + str(SDK_ROOT),
-            "platform-tools",
-            "platforms;android-36",
-            "build-tools;36.0.0",
-        ],
-        env=env,
-    )
+    env["JAVA_HOME"] = str(java_home)
+
+    platform = SDK_ROOT / "platforms" / "android-36"
+    build_tools = SDK_ROOT / "build-tools" / "36.0.0"
+    license_marker = SDK_ROOT / ".licenses_accepted"
+
+    if not license_marker.exists():
+        _run(
+            [str(sdkmanager), "--sdk_root=" + str(SDK_ROOT), "--licenses"],
+            env=env,
+            input_text="y\n" * 40,
+            timeout=300,
+        )
+        license_marker.touch()
+
+    missing: list[str] = []
+    if not platform.exists():
+        missing.append("platforms;android-36")
+    if not build_tools.exists():
+        missing.append("build-tools;36.0.0")
+    if missing:
+        _run(
+            [str(sdkmanager), "--sdk_root=" + str(SDK_ROOT), *missing],
+            env=env,
+            timeout=900,
+        )
+
+    TOOLCHAIN_READY.touch()
     return SDK_ROOT
 
 
@@ -157,14 +185,36 @@ def _safe_slug(value: str) -> str:
     return (value or "android_gpt_agent")[:48]
 
 
+def _build_key(app_name: str, server_url: str, features: dict[str, bool]) -> str:
+    payload = {
+        "app_name": app_name,
+        "server_url": server_url.rstrip("/"),
+        "features": features,
+        "builder": 4,
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(raw).hexdigest()[:20]
+
+
+def _escaped_java_string(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r")
+
+
 def write_android_project(project: Path, app_name: str, server_url: str, features: dict[str, bool]) -> None:
     package_name = "com.jolgue.androidgptagent"
     src = project / "app" / "src" / "main"
     java_dir = src / "java" / Path(*package_name.split("."))
     java_dir.mkdir(parents=True, exist_ok=True)
-    (src / "res" / "xml").mkdir(parents=True, exist_ok=True)
 
-    strings = f'''<resources>\n    <string name="app_name">{app_name.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')}</string>\n</resources>\n'''
+    safe_app_name = (
+        app_name.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )
+    strings = f'''<resources>\n    <string name="app_name">{safe_app_name}</string>\n</resources>\n'''
+
     manifest = '''<manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
     <application android:theme="@style/AppTheme" android:label="@string/app_name" android:usesCleartextTraffic="true" android:allowBackup="false" android:supportsRtl="true">
@@ -177,8 +227,9 @@ def write_android_project(project: Path, app_name: str, server_url: str, feature
     </application>
 </manifest>
 '''
-    styles_dir = src / "res" / "values"
-    styles_dir.mkdir(parents=True, exist_ok=True)
+
+    values_dir = src / "res" / "values"
+    values_dir.mkdir(parents=True, exist_ok=True)
     styles = '''<resources>
     <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
         <item name="android:fontFamily">sans</item>
@@ -186,8 +237,10 @@ def write_android_project(project: Path, app_name: str, server_url: str, feature
     </style>
 </resources>
 '''
+
     endpoint = server_url.rstrip("/") + "/api/devices/register"
     heartbeat = server_url.rstrip("/") + "/api/devices/{device_id}/heartbeat"
+    title = _escaped_java_string(app_name)
     java = f'''package {package_name};
 
 import android.app.Activity;
@@ -208,8 +261,8 @@ import java.util.UUID;
 public class MainActivity extends Activity {{
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final String deviceId = UUID.randomUUID().toString();
-    private final String registerUrl = "{endpoint}";
-    private final String heartbeatUrl = "{heartbeat}";
+    private final String registerUrl = "{_escaped_java_string(endpoint)}";
+    private final String heartbeatUrl = "{_escaped_java_string(heartbeat)}";
     private TextView status;
 
     @Override public void onCreate(Bundle state) {{
@@ -219,7 +272,7 @@ public class MainActivity extends Activity {{
         layout.setPadding(48, 64, 48, 48);
         layout.setGravity(Gravity.CENTER);
         TextView title = new TextView(this);
-        title.setText("{app_name.replace('"', '\\"')}");
+        title.setText("{title}");
         title.setTextSize(24);
         status = new TextView(this);
         status.setText("A ligar ao servidor…");
@@ -255,41 +308,91 @@ public class MainActivity extends Activity {{
     }}
 }}
 '''
-    (project / "settings.gradle").write_text("pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }\ndependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }\nrootProject.name = 'AndroidGPTAgent'\ninclude ':app'\n", encoding="utf-8")
-    (project / "build.gradle").write_text("plugins { id 'com.android.application' version '9.3.0' apply false }\n", encoding="utf-8")
-    (project / "gradle.properties").write_text("org.gradle.jvmargs=-Xmx1536m -Dfile.encoding=UTF-8\nandroid.useAndroidX=true\n", encoding="utf-8")
-    (project / "app" / "build.gradle").write_text("""plugins { id 'com.android.application' }\n\nandroid {\n    namespace 'com.jolgue.androidgptagent'\n    compileSdk 36\n    defaultConfig {\n        applicationId 'com.jolgue.androidgptagent'\n        minSdk 23\n        targetSdk 36\n        versionCode 1\n        versionName '1.0'\n    }\n}\n""", encoding="utf-8")
+
+    (project / "settings.gradle").write_text(
+        "pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }\n"
+        "dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }\n"
+        "rootProject.name = 'AndroidGPTAgent'\ninclude ':app'\n",
+        encoding="utf-8",
+    )
+    (project / "build.gradle").write_text(
+        "plugins { id 'com.android.application' version '9.3.0' apply false }\n",
+        encoding="utf-8",
+    )
+    (project / "gradle.properties").write_text(
+        "org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8\n"
+        "org.gradle.caching=true\n"
+        "org.gradle.parallel=true\n"
+        "org.gradle.configuration-cache=true\n"
+        "org.gradle.daemon=true\n"
+        "android.useAndroidX=true\n",
+        encoding="utf-8",
+    )
+    (project / "app" / "build.gradle").write_text(
+        """plugins { id 'com.android.application' }\n\nandroid {\n    namespace 'com.jolgue.androidgptagent'\n    compileSdk 36\n    defaultConfig {\n        applicationId 'com.jolgue.androidgptagent'\n        minSdk 23\n        targetSdk 36\n        versionCode 1\n        versionName '1.0'\n    }\n}\n""",
+        encoding="utf-8",
+    )
     (src / "AndroidManifest.xml").write_text(manifest, encoding="utf-8")
     (src / "res" / "values" / "strings.xml").write_text(strings, encoding="utf-8")
     (src / "res" / "values" / "styles.xml").write_text(styles, encoding="utf-8")
     (java_dir / "MainActivity.java").write_text(java, encoding="utf-8")
     (project / "android-gpt.json").write_text(
-        __import__("json").dumps({"app_name": app_name, "server_url": server_url, "features": features}, indent=2),
+        json.dumps({"app_name": app_name, "server_url": server_url, "features": features}, indent=2),
         encoding="utf-8",
     )
 
 
 def build_apk(app_name: str, server_url: str, features: dict[str, bool]) -> tuple[Path, Path]:
+    build_key = _build_key(app_name, server_url, features)
+    final_dir = settings.generated / "apks"
+    final_dir.mkdir(parents=True, exist_ok=True)
+    final_apk = final_dir / f"{_safe_slug(app_name)}-{build_key}.apk"
+
+    # Exact same build: return the existing artifact without invoking Gradle.
+    if final_apk.is_file() and final_apk.stat().st_size > 0:
+        return final_apk, WORKSPACE
+
     with _lock:
+        if final_apk.is_file() and final_apk.stat().st_size > 0:
+            return final_apk, WORKSPACE
+
         BUILD_ROOT.mkdir(parents=True, exist_ok=True)
-        project = BUILD_ROOT / f"{_safe_slug(app_name)}_{os.getpid()}"
-        if project.exists():
-            shutil.rmtree(project)
-        project.mkdir(parents=True)
-        write_android_project(project, app_name, server_url, features)
+        WORKSPACE.mkdir(parents=True, exist_ok=True)
+
         java_home = _java_home()
-        sdk = _ensure_sdk()
+        sdk = _ensure_sdk(java_home)
         gradle = _gradle_bin()
+
+        # Reuse one persistent Gradle project instead of deleting/recreating it.
+        # This lets Gradle/AGP keep incremental state between APK generations.
+        write_android_project(WORKSPACE, app_name, server_url, features)
+
         env = os.environ.copy()
         env["JAVA_HOME"] = str(java_home)
         env["ANDROID_HOME"] = str(sdk)
         env["ANDROID_SDK_ROOT"] = str(sdk)
-        _run([str(gradle), "--no-daemon", "assembleDebug"], cwd=project, env=env)
-        apk = project / "app" / "build" / "outputs" / "apk" / "debug" / "app-debug.apk"
+        env["GRADLE_USER_HOME"] = str(TOOLCHAIN_ROOT / "gradle-user-home")
+
+        cpu_count = os.cpu_count() or 2
+        workers = max(2, min(8, cpu_count))
+        command = [
+            str(gradle),
+            "--daemon",
+            "--parallel",
+            "--configuration-cache",
+            f"--max-workers={workers}",
+        ]
+        if GRADLE_READY.exists():
+            command.append("--offline")
+        command.append("assembleDebug")
+
+        _run(command, cwd=WORKSPACE, env=env, timeout=900)
+
+        apk = WORKSPACE / "app" / "build" / "outputs" / "apk" / "debug" / "app-debug.apk"
         if not apk.exists():
             raise RuntimeError("A compilação terminou sem produzir o APK.")
-        final_dir = settings.generated / "apks"
-        final_dir.mkdir(parents=True, exist_ok=True)
-        final_apk = final_dir / f"{_safe_slug(app_name)}.apk"
+
+        # The first successful build proves that Gradle dependencies are cached locally.
+        GRADLE_READY.touch()
         shutil.copy2(apk, final_apk)
-        return final_apk, project
+        return final_apk, WORKSPACE
