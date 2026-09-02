@@ -1,0 +1,26 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 80
+  },
+  "database": "data/android_gpt.db",
+  "paths": {
+    "templates": "templates",
+    "static": "static",
+    "generated": "generated",
+    "logs": "data/logs"
+  },
+  "auth": {
+    "admin_username": "admin",
+    "admin_password_env": "ADMIN_PASSWORD",
+    "session_secret_env": "SESSION_SECRET"
+  },
+  "logging": {
+    "level": "INFO",
+    "access": true
+  },
+  "android": {
+    "require_explicit_pairing": true,
+    "allowed_commands": ["ping", "refresh", "notify"]
+  }
+}
