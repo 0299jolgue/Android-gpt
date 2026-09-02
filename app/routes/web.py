@@ -13,15 +13,20 @@ def guard(request: Request):
         return RedirectResponse("/login", status_code=303)
     return None
 
+def render(request: Request, name: str, context: dict, status_code: int = 200):
+    context = dict(context)
+    context["request"] = request
+    return templates.TemplateResponse(request=request, name=name, context=context, status_code=status_code)
+
 @router.get("/login", response_class=HTMLResponse)
 def login(request: Request):
-    return templates.TemplateResponse("login.html", {"request": request, "error": None})
+    return render(request, "login.html", {"error": None})
 
 @router.post("/login")
 def login_post(request: Request, username: str = Form(...), password: str = Form(...)):
     user = get_user(username)
     if not user or not verify_password(password, user["password_hash"]):
-        return templates.TemplateResponse("login.html", {"request": request, "error": "Credenciais inválidas."}, status_code=401)
+        return render(request, "login.html", {"error": "Credenciais inválidas."}, 401)
     request.session["user"] = username
     return RedirectResponse("/", status_code=303)
 
@@ -35,22 +40,22 @@ def dashboard(request: Request):
     if (r := guard(request)): return r
     devices = list_devices()
     online = sum(d["status"] == "online" for d in devices)
-    return templates.TemplateResponse("dashboard.html", {"request": request, "devices": devices, "total": len(devices), "online": online, "offline": len(devices)-online, "active": "dashboard"})
+    return render(request, "dashboard.html", {"devices": devices, "total": len(devices), "online": online, "offline": len(devices)-online, "active": "dashboard"})
 
 @router.get("/devices", response_class=HTMLResponse)
 def devices_page(request: Request):
     if (r := guard(request)): return r
-    return templates.TemplateResponse("devices.html", {"request": request, "devices": list_devices(), "active": "devices"})
+    return render(request, "devices.html", {"devices": list_devices(), "active": "devices"})
 
 @router.get("/devices/{device_id}", response_class=HTMLResponse)
 def device_page(request: Request, device_id: str):
     if (r := guard(request)): return r
     device = get_device(device_id)
     if not device:
-        return templates.TemplateResponse("device.html", {"request": request, "device": None, "active": "devices"}, status_code=404)
-    return templates.TemplateResponse("device.html", {"request": request, "device": device, "active": "devices"})
+        return render(request, "device.html", {"device": None, "active": "devices"}, 404)
+    return render(request, "device.html", {"device": device, "active": "devices"})
 
 @router.get("/generator", response_class=HTMLResponse)
 def generator_page(request: Request):
     if (r := guard(request)): return r
-    return templates.TemplateResponse("generator.html", {"request": request, "active": "generator", "result": None})
+    return render(request, "generator.html", {"active": "generator", "result": None})
