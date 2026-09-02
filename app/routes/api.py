@@ -1,11 +1,43 @@
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
-from ..database import upsert_device, get_device, list_devices, set_device_status
+from fastapi.responses import FileResponse, JSONResponse
+
+from ..config import settings
+from ..database import get_device, list_devices, set_device_status, upsert_device
 from ..security import is_authenticated
-from ..services.generator import create_project
+from ..services.apk_builder import build_apk
+from ..services.generator import FEATURES, create_project
 
 router = APIRouter()
+_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="apk-builder")
+_jobs: dict[str, dict] = {}
+
+
+def _public_server_url(request: Request) -> str:
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+    scheme = forwarded_proto or request.url.scheme
+    host = request.headers.get("x-forwarded-host", "").split(",")[0].strip() or request.headers.get("host", "").strip()
+    if not host:
+        host = request.url.netloc
+    return f"{scheme}://{host}".rstrip("/")
+
+
+def _run_build(job_id: str, app_name: str, server_url: str, features: dict[str, bool]) -> None:
+    _jobs[job_id].update({"status": "building", "message": "A preparar o ambiente Android e a compilar o APK…"})
+    try:
+        apk, project = build_apk(app_name, server_url, features)
+        _jobs[job_id].update({
+            "status": "ready",
+            "message": "APK pronto.",
+            "download": f"/api/generator/download/{apk.name}",
+            "project": str(project.relative_to(settings.generated)),
+        })
+    except Exception as exc:
+        _jobs[job_id].update({"status": "error", "message": str(exc)})
 
 
 @router.get("/health")
@@ -26,20 +58,40 @@ async def generator(request: Request):
         return JSONResponse({"ok": False, "error": "login_required"}, status_code=401)
 
     data = await request.form()
-    # The public server address is detected automatically from the incoming request.
-    # It is not exposed as a generator field the user needs to configure.
-    server_url = str(request.base_url).rstrip("/")
-    project = create_project(
-        str(data.get("app_name", "Android GPT Agent")),
-        server_url,
-        {
-            "device_info": bool(data.get("device_info")),
-            "battery": bool(data.get("battery")),
-            "notifications": bool(data.get("notifications")),
-            "selected_files": bool(data.get("selected_files")),
-        },
-    )
-    return {"ok": True, "project": str(project.relative_to(project.parents[1]))}
+    app_name = str(data.get("app_name", "Android GPT Agent")).strip() or "Android GPT Agent"
+    server_url = _public_server_url(request)
+    features = {name: bool(data.get(name)) for name in FEATURES}
+    create_project(app_name, server_url, features)
+
+    job_id = uuid.uuid4().hex
+    _jobs[job_id] = {
+        "status": "queued",
+        "message": "APK colocado na fila de compilação.",
+        "app_name": app_name,
+    }
+    _executor.submit(_run_build, job_id, app_name, server_url, features)
+    return {"ok": True, "job_id": job_id, "status_url": f"/api/generator/status/{job_id}"}
+
+
+@router.get("/generator/status/{job_id}")
+def generator_status(request: Request, job_id: str):
+    if not is_authenticated(request):
+        return JSONResponse({"ok": False, "error": "login_required"}, status_code=401)
+    job = _jobs.get(job_id)
+    if not job:
+        return JSONResponse({"ok": False, "error": "job_not_found"}, status_code=404)
+    return {"ok": True, "job_id": job_id, **job}
+
+
+@router.get("/generator/download/{filename}")
+def generator_download(request: Request, filename: str):
+    if not is_authenticated(request):
+        return JSONResponse({"ok": False, "error": "login_required"}, status_code=401)
+    safe = Path(filename).name
+    path = settings.generated / "apks" / safe
+    if path.parent != settings.generated / "apks" or not path.is_file() or path.suffix.lower() != ".apk":
+        return JSONResponse({"ok": False, "error": "apk_not_found"}, status_code=404)
+    return FileResponse(path, media_type="application/vnd.android.package-archive", filename=safe)
 
 
 @router.post("/devices/register")
